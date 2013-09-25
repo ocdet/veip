@@ -25,7 +25,7 @@
 //
 // LIBS     :
 // CFLAGS   : -DLINUX
-// AUTHER   : K.ISE <@ibucho>, T.ITO, 
+// AUTHOR   : K.ISE <@ibucho>, T.ITO, 
 // 
 // USAGE    : veip -i dev -L log -f frag_size peer1 peer2 peer3 .....
 //            'D' - debug mode enable.
@@ -35,11 +35,12 @@
 //            'f' - fragment size. default is 1024 bye.
 //
 // HISTORY  : release 0.1 <Aug 2012>
-//            二拠点間限定版。フラッグメントしないパケットの交換だけ実装
+//            Works only for 2 peers. Implemented only no fragmented packets
+//            exchange.
 //            include: veip.c subr.c abuf.c
 //
 //            release 0.2 <Dec 2012>
-//            マルチサイトをサポート。フラッグメント、デフラグを実装
+//            Support multi sites. Implemented fragmentation/defragmentation.
 //            include: veip.c subr.c abuf.c pbuf.c debug.c
 //
 #include "veip.h"
@@ -59,7 +60,7 @@ char * logfn = "./log";
 int main(int argc, char *argv[], char *envp){
 
   int ch;
-  char * dev = "eth1"; // OCDETのGWはeth1がグローバル
+  char * dev = "eth1"; // FIXME: Hard coded. (On OCDET GW, eth1 is global.)
   int debug = 0;
   int appnd = 0;
 
@@ -93,7 +94,7 @@ int main(int argc, char *argv[], char *envp){
   }
 
   // initializing log file
-  // アペンドモードでなければログファイルをゼロクリアしとく
+  // Zero clear the log file if not append mode.
   FILE * lfp; 
   if(!appnd){
     if((lfp = fopen(logfn, "w")) < 0){
@@ -105,14 +106,14 @@ int main(int argc, char *argv[], char *envp){
   logging(logfn, "starting veip program .... ");
 
   // set peer name to vpeer struct.
-  // pnumとpeer[]はグローバルexternにしたほうがいいかもしんない
-  char str[LINLEN]; // ロギング用バッファ
-  int pnum = 0;  // pnum + 1 がピアーの数
+  // Maybe pnum and peer[] are global/extern.
+  char str[LINLEN]; // logging buffer
+  int pnum = 0;  // pnum + 1 is number of peers.
   struct vpeer peer[MAX_PEER_NUM];
   while(optind < argc) peer[pnum++].name = argv[optind++];
-  in_addr_t vp_gw; // 32bit形式のIPアドレスだけど後方互換としてこんな名称
-  char      ipaddr[INET_ADDRSTRLEN]; // inet_ntopに使うだけの文字列
-  int i; // forループ用の共通カウンタ
+  in_addr_t vp_gw; // 32bit format IP address. Use the name for backword compatibility.
+  char      ipaddr[INET_ADDRSTRLEN]; //a string only for inet_ntop
+  int i; // common counter for 'for statements'
   for(i = 0; i < pnum ; i++){
     if(set_peer(&peer[i]) < 0){
       logging(logfn, "set_peer error\n");
@@ -126,7 +127,7 @@ int main(int argc, char *argv[], char *envp){
   }
 
   // create socket with port VEIP, to recv packets.
-  // リモートVEIPピアーからの受信用
+  // For receive from the remote VEIP peer.
   int recv;
   if((recv= crecvsock(VEIP)) < 0){
     memset(str, 0, sizeof(str));
@@ -135,7 +136,7 @@ int main(int argc, char *argv[], char *envp){
     return(-1);
   }
   // create network interface discriptor
-  // マルチdevインターフェースにするにはここも関数化必要
+  // Need to make below as a function to support multi devices interface.
   int nif; 
   if((nif = get_nif(dev)) < 0){ // init local device
     memset(str, 0, sizeof(str));
@@ -143,11 +144,11 @@ int main(int argc, char *argv[], char *envp){
     logging(logfn, str);
     return(-1);
   }
-  int gfd = recv;  // select用最大記述子番号
+  int gfd = recv;  // maximal file descriptor number for select()
   if(nif > recv) gfd = nif;
 
   // create socket with port CNTL, to communicate manager
-  // マネージャとの通信用ポート(0.2では未実装)
+  // The port for communication with manager. (Not implemented in 0.2)
   //
   int ctlp;
   if((ctlp= crecvsock(CNTL)) < 0){
@@ -158,14 +159,14 @@ int main(int argc, char *argv[], char *envp){
   }
   if(ctlp > gfd) gfd = ctlp;
 
-  // selectに nif, recv, ctlpをセット
+  // Set nif, recv and ctlp for select().
   fd_set fd, rfd;
   FD_ZERO(&rfd);
   FD_SET(nif, &rfd);
   FD_SET(recv, &rfd);
   FD_SET(ctlp, &rfd);
 
-  // ヘッダ解析用バッファを準備しとく
+  // Prepare a buffer for header analysis.
   struct ether_header * ehdr;
   ehdr = malloc(sizeof(struct ether_header));
   if(ehdr == NULL) return(-1);
@@ -174,22 +175,22 @@ int main(int argc, char *argv[], char *envp){
   earp = malloc(sizeof(struct ether_arp));
   if(earp == NULL) return(-1);
 
-  // パケットバッファとパケット長、abufポインタ作っとく
+  // Create an abuf pointer. Packet buffer and packet length.
   u_char pbuf[ETHER_MAX_LEN + 64];
   u_int len;
   struct abuf * ac = (struct abuf *)a_get();
   if(ac == NULL) return(-1);
 
-  // recvfromで受信するためのパラメタ
+  // Parameters for recvfrom()
   struct sockaddr_in s_addr;
   int s_size = sizeof(struct sockaddr_in);
 
   init_pbuf_list(); // test added by ito
-  struct abuf * ap; // 転送先vp_gwを探すためのabufポインタ
-  int cnt = 0;      // 受信パケットカウンタ
+  struct abuf * ap; // abuf pointer to search the destination vp_gw
+  int cnt = 0;      // receive packet counter
 
-  // ここから無限ループ。forkして親は戻る。
-  // いずれsignalで終了処理を実装せねば
+  // Infinite loop below. The parent process returns after calling fork().
+  // FIXME: Implement exit processing using SIGNAL.
   int pid;
   if((pid = fork()) < 0){
     memset(str, 0, sizeof(str));
@@ -208,9 +209,9 @@ int main(int argc, char *argv[], char *envp){
     memset(pbuf, 0, sizeof(pbuf));
     memset(ehdr, 0, sizeof(struct ether_header));
     //*******************************************************
-    // VEIPピアーからパケットを受け取った時の処理
-    // a_lookup_ethや、いずれVLANマッピングする時に送信元が
-    // 必要なのでrecvfromで受け取る
+    // Handle packets received from VEIP peers.
+    // Use recvfrom() because we need a_lookup_eth and the source address
+    // when we implement VLAN mapping.
     //*******************************************************
     if(FD_ISSET(recv, &fd)){
       memset(&s_addr, 0, sizeof(struct sockaddr_in));
@@ -229,7 +230,7 @@ int main(int argc, char *argv[], char *envp){
     }
 
     //************************************************************
-    // devインターフェースからパケットを受け取った時の処理
+    // Process packets when received from dev interface.
     //************************************************************
     if(FD_ISSET(nif, &fd)){
       len = read(nif, pbuf, sizeof(pbuf));
@@ -237,14 +238,14 @@ int main(int argc, char *argv[], char *envp){
       memcpy(ehdr, pbuf, sizeof(struct ether_header));
 
       if(ntohs(ehdr->ether_type) == ETHERTYPE_VLAN){
-        // タグVLANだったら
-        // いまんとこ何もしない
+        // In case Tag-VLAN,
+        // Nothing to do at the moment.
         continue;
       }
 
-      // IPパケットだったら
+      // In case IP packet,
       if(ntohs(ehdr->ether_type) == ETHERTYPE_IP){
-        // src dstの mac が0x00や0xffだったら無視する
+        // Ignore it if mac address of src/dst was 0x00 or 0xff.
         if(ehackzero(ehdr->ether_dhost) || ehackzero(ehdr->ether_shost)) continue;
         if(ehackbcas(ehdr->ether_dhost) || ehackbcas(ehdr->ether_shost)) continue;
 
@@ -267,13 +268,13 @@ int main(int argc, char *argv[], char *envp){
         continue;
       }  // if(ntohs(ehdr->ether_type) == ETHERTYPE_IP){
 
-      // ARPパケットだったら
+      // In case ARP packet,
       if(ntohs(ehdr->ether_type) == ETHERTYPE_ARP){
         memset(earp, 0, sizeof(struct ether_arp));
         memcpy(earp, pbuf + sizeof(struct ether_header), sizeof(struct ether_arp));
 
         switch(ntohs(earp->arp_op)){
-        case ARPOP_REQUEST: // これARPリクエストやからブロードキャストせな
+        case ARPOP_REQUEST: //Broadcast it because it's an ARP Request.
           for(i = 0; i < pnum ; i++){
             (void)sendveip(peer[i].sock, peer[i].name, pbuf, len);
             if(debug){
@@ -285,7 +286,7 @@ int main(int argc, char *argv[], char *envp){
             } // if(debug)
           }
           break;
-        case ARPOP_REPLY: // これARPの返事やからvp_gw宛てに返さな
+        case ARPOP_REPLY: //Return it to vp_gw becase it's an ARP reply.
           ap = (struct abuf *)a_lookup_eth(ac, earp->arp_tha);
           if (ap <= 0) {
             if(debug){
@@ -303,7 +304,7 @@ int main(int argc, char *argv[], char *envp){
             break;
           }
           for(i = 0; i < pnum ; i++){ 
-            if(ap->target.vp_gw == peer[i].vp_gw){ // vp_gwどれや？
+            if(ap->target.vp_gw == peer[i].vp_gw){ // Lookup vp_gw
               if(sendveip(peer[i].sock, peer[i].name, pbuf, len) < 0) break;
               else{
                 if(debug){
@@ -320,7 +321,7 @@ int main(int argc, char *argv[], char *envp){
                   fprintf(lfp, "\n");
                   fclose(lfp);
                 } // if(debug)
-                break; // 見つかったのでループ抜ける
+                break; // Exit loop because vp_gw found.
               }
             }
           }
@@ -333,7 +334,7 @@ int main(int argc, char *argv[], char *envp){
     } // if(FD_ISSET(nif, &fd))
   } // while(TRUE)
 
-  // ここまで来ないけど念のため
+  // Never here.
   return(0);
 }
 
